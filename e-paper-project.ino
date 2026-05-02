@@ -12,11 +12,10 @@
 #define EPD_DC    17
 #define EPD_RST   16
 #define EPD_BUSY  4
-
 #define BTN_NEXT  12
 #define BTN_PREV  13
 
-// ── Display for 7.5" (800x480 physical, we use rotation 0 for portrait) ──
+// ── Display ─────────────────────────────────────────────────────
 #define MAX_BUFFER_SIZE 65536ul
 #define MAX_HEIGHT(EPD) (EPD::HEIGHT <= MAX_BUFFER_SIZE / (EPD::WIDTH / 8) \
                            ? EPD::HEIGHT \
@@ -30,11 +29,8 @@ Preferences prefs;
 int currentPage = 1;
 int totalPages  = 0;
 
-unsigned long lastNextPress = 0;
-unsigned long lastPrevPress = 0;
-const unsigned long DEBOUNCE_MS = 280;
-
 // ── BMP Header ──────────────────────────────────────────────────
+// Defined BEFORE any function that uses it
 struct BmpHeader {
   uint32_t dataOffset;
   int32_t  width, height;
@@ -44,6 +40,30 @@ struct BmpHeader {
   bool     palette_white[2];
 };
 
+// ── Interrupt State ─────────────────────────────────────────────
+// Defined AFTER struct, BEFORE ISR functions
+volatile int pageStep = 0;
+unsigned long lastInterruptTime = 0;
+const unsigned long DEBOUNCE_MS = 200;
+
+// ── Interrupt Handlers ───────────────────────────────────────────
+void IRAM_ATTR onNextPressed() {
+  unsigned long now = millis();
+  if (now - lastInterruptTime > DEBOUNCE_MS) {
+    lastInterruptTime = now;
+    pageStep = 1;
+  }
+}
+
+void IRAM_ATTR onPrevPressed() {
+  unsigned long now = millis();
+  if (now - lastInterruptTime > DEBOUNCE_MS) {
+    lastInterruptTime = now;
+    pageStep = -1;
+  }
+}
+
+// ── BMP Helpers ─────────────────────────────────────────────────
 static uint16_t read16(fs::File &f) {
   uint16_t v; f.read((uint8_t *)&v, 2); return v;
 }
@@ -51,10 +71,8 @@ static uint32_t read32(fs::File &f) {
   uint32_t v; f.read((uint8_t *)&v, 4); return v;
 }
 
-// ── Parse BMP Header ────────────────────────────────────────────
 bool parseBmpHeader(fs::File &f, BmpHeader &bmp) {
   if (read16(f) != 0x4D42) return false;
-
   read32(f); read32(f);
   bmp.dataOffset = read32(f);
   read32(f);
@@ -67,13 +85,12 @@ bool parseBmpHeader(fs::File &f, BmpHeader &bmp) {
 
   if (compress != 0) return false;
 
-  bmp.flip = (bmp.height > 0);   // positive height = bottom-up BMP
+  bmp.flip    = (bmp.height > 0);
   if (bmp.height < 0) bmp.height = -bmp.height;
   bmp.rowSize = ((bmp.width * bmp.bitDepth + 31) / 32) * 4;
 
   bmp.palette_white[0] = true;
   bmp.palette_white[1] = false;
-
   if (bmp.bitDepth == 1) {
     f.seek(14 + 40, SeekSet);
     for (int i = 0; i < 2; i++) {
@@ -109,26 +126,23 @@ bool drawPage(int pageNum) {
 
   BmpHeader bmp;
   if (!parseBmpHeader(file, bmp)) {
-    Serial.println("ERROR: BMP header parse failed");
+    Serial.println("ERROR: BMP parse failed");
     file.close();
     return false;
   }
 
-  Serial.printf("BMP: %dx%d  Display: %dx%d\n",
-                bmp.width, bmp.height, display.width(), display.height());
+  Serial.printf("Page %d  BMP:%dx%d  depth:%d\n",
+                pageNum, bmp.width, bmp.height, bmp.bitDepth);
 
-  display.setRotation(1);    // portrait: display reports 480 wide x 800 tall
+  display.setRotation(1);
   display.setFullWindow();
 
-  uint8_t rowBuffer[1440];   // 480 * 3 bytes max (24-bit row)
+  uint8_t rowBuffer[1440];
 
   display.firstPage();
   do {
-
     for (int32_t y = 0; y < display.height(); y++) {
-
       if (y >= bmp.height) {
-        // Fill any extra rows white if BMP is shorter than display
         for (int32_t x = 0; x < display.width(); x++)
           display.drawPixel(x, y, GxEPD_WHITE);
         continue;
@@ -140,24 +154,20 @@ bool drawPage(int pageNum) {
 
       for (int32_t x = 0; x < display.width(); x++) {
         bool isWhite;
-
         if (bmp.bitDepth == 1) {
           uint8_t bitVal = (rowBuffer[x / 8] >> (7 - (x % 8))) & 1;
           isWhite = bmp.palette_white[bitVal];
         } else {
-          // 24-bit BGR
           uint32_t idx = x * 3;
           isWhite = ((rowBuffer[idx] + rowBuffer[idx+1] + rowBuffer[idx+2]) > 384);
         }
-
         display.drawPixel(x, y, isWhite ? GxEPD_WHITE : GxEPD_BLACK);
       }
     }
-
   } while (display.nextPage());
 
   file.close();
-  Serial.printf("Page %d rendered OK\n", pageNum);
+  Serial.printf("Page %d done.\n", pageNum);
   return true;
 }
 
@@ -183,6 +193,8 @@ void setup() {
 
   pinMode(BTN_NEXT, INPUT_PULLUP);
   pinMode(BTN_PREV, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BTN_NEXT), onNextPressed, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_PREV), onPrevPressed, FALLING);
 
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS mount failed!");
@@ -201,7 +213,7 @@ void setup() {
   display.init(115200, true, 20, false);
 
   Serial.printf("Resuming at page %d / %d\n", currentPage, totalPages);
-  Serial.printf("Display logical size: %d x %d\n", display.width(), display.height());
+  Serial.printf("Display size: %d x %d\n", display.width(), display.height());
 
   drawPage(currentPage);
   display.hibernate();
@@ -209,23 +221,16 @@ void setup() {
 
 // ── Loop ────────────────────────────────────────────────────────
 void loop() {
-  unsigned long now = millis();
+  int step = pageStep;
+  if (step != 0) {
+    pageStep = 0;
 
-  if (digitalRead(BTN_NEXT) == LOW && (now - lastNextPress > DEBOUNCE_MS)) {
-    lastNextPress = now;
-    if (currentPage < totalPages) {
-      currentPage++;
+    int newPage = constrain(currentPage + step, 1, totalPages);
+    if (newPage != currentPage) {
+      currentPage = newPage;
       saveCurrentPage(currentPage);
-      drawPage(currentPage);
-      display.hibernate();
-    }
-  }
-
-  if (digitalRead(BTN_PREV) == LOW && (now - lastPrevPress > DEBOUNCE_MS)) {
-    lastPrevPress = now;
-    if (currentPage > 1) {
-      currentPage--;
-      saveCurrentPage(currentPage);
+      Serial.printf("%s → page %d / %d\n",
+                    step > 0 ? "NEXT" : "PREV", currentPage, totalPages);
       drawPage(currentPage);
       display.hibernate();
     }
