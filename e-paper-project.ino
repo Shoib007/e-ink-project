@@ -12,8 +12,8 @@
 #define EPD_DC    17
 #define EPD_RST   16
 #define EPD_BUSY  4
-#define BTN_NEXT  12
-#define BTN_PREV  13
+#define BTN_NEXT  25
+#define BTN_PREV  26
 
 // ── Display ─────────────────────────────────────────────────────
 #define MAX_BUFFER_SIZE 65536ul
@@ -134,36 +134,63 @@ bool drawPage(int pageNum) {
   Serial.printf("Page %d  BMP:%dx%d  depth:%d\n",
                 pageNum, bmp.width, bmp.height, bmp.bitDepth);
 
-  display.setRotation(1);
+  display.setRotation(3);
   display.setFullWindow();
 
   uint8_t rowBuffer[1440];
+  int32_t lastFileRow = -1;
+  int32_t baseY = 0;   // 🔥 tracks vertical offset
 
   display.firstPage();
   do {
-    for (int32_t y = 0; y < display.height(); y++) {
-      if (y >= bmp.height) {
-        for (int32_t x = 0; x < display.width(); x++)
-          display.drawPixel(x, y, GxEPD_WHITE);
+    uint16_t page_h = display.pageHeight();
+
+    for (int32_t y = 0; y < page_h; y++) {
+
+      int32_t screenY = baseY + y;
+
+      if (screenY >= bmp.height) {
+        // fill remaining with white
+        for (int32_t x = 0; x < display.width(); x++) {
+          display.drawPixel(x, screenY, GxEPD_WHITE);
+        }
         continue;
       }
 
-      uint32_t fileRow = bmp.flip ? (bmp.height - 1 - y) : y;
-      file.seek(bmp.dataOffset + fileRow * bmp.rowSize);
-      file.read(rowBuffer, bmp.rowSize);
+      uint32_t fileRow = bmp.flip
+                         ? (bmp.height - 1 - screenY)
+                         : screenY;
 
-      for (int32_t x = 0; x < display.width(); x++) {
+      if (fileRow != (uint32_t)lastFileRow) {
+        file.seek(bmp.dataOffset + fileRow * bmp.rowSize);
+        file.read(rowBuffer, bmp.rowSize);
+        lastFileRow = fileRow;
+      }
+
+      for (int32_t x = 0; x < display.width() && x < bmp.width; x++) {
+
         bool isWhite;
         if (bmp.bitDepth == 1) {
-          uint8_t bitVal = (rowBuffer[x / 8] >> (7 - (x % 8))) & 1;
+          uint8_t bitVal =
+            (rowBuffer[x / 8] >> (7 - (x % 8))) & 1;
           isWhite = bmp.palette_white[bitVal];
         } else {
           uint32_t idx = x * 3;
-          isWhite = ((rowBuffer[idx] + rowBuffer[idx+1] + rowBuffer[idx+2]) > 384);
+          isWhite = ((rowBuffer[idx] +
+                      rowBuffer[idx + 1] +
+                      rowBuffer[idx + 2]) > 384);
         }
-        display.drawPixel(x, y, isWhite ? GxEPD_WHITE : GxEPD_BLACK);
+
+        display.drawPixel(
+          x,
+          screenY,
+          isWhite ? GxEPD_WHITE : GxEPD_BLACK
+        );
       }
     }
+
+    baseY += page_h;   // 🔥 move to next stripe
+
   } while (display.nextPage());
 
   file.close();
